@@ -5,6 +5,11 @@ from nltk.tokenize import word_tokenize
 from nltk.stem import PorterStemmer
 from nltk.corpus import stopwords
 import math
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import regexp_replace, col
+from typing import List
+import os
 
 #Uncomment the below if running the code for the first time to download specific libraries from NLTK.
 #nltk.download('punkt')
@@ -66,7 +71,7 @@ def getSentencesPerWord(frequencyMatrix):
     return coutWordPerDoc
 
 
-#IDF = ln([Total number of documents]/[Number of documents in which term x appears])
+#IDF = log([Total number of documents]/[Number of documents in which term x appears])
 def createIDFMatrix(frequencyMatrix, countDocPerWords, totalDocuments):
     IDFMatrix = {}
 
@@ -80,15 +85,80 @@ def createIDFMatrix(frequencyMatrix, countDocPerWords, totalDocuments):
     
     return IDFMatrix
 
+def createTFIDFMatrix(TFMatrix, IDFMatrix):
+    TFIDFMatrix = {}
+
+    for (sentence1, FreqTable1), (sentence2, FreqTable2) in zip(TFMatrix.items(), IDFMatrix.items()):
+        TFIDFTable = {}
+
+        for (word1, value1), (word2, value2) in zip(FreqTable1.items(), FreqTable2.items()): #Keys will be same for both the tables
+            TFIDFTable[word1] = float(value1*value2)
+
+        TFIDFMatrix[sentence1] = TFIDFTable
+    
+    return TFIDFMatrix
+
+
+def scoreSentences(TFIDFMatrix) -> dict:
+    sentenceScore = {}#defined as (sum of TF-IDF values of words in the sentence) / (Total number of words in the sentence)
+
+    for sentence, TFIDFTable in TFIDFMatrix.items():
+        sentenceScoreSum = 0 
+        wordCount = len(TFIDFTable)#wordCount in the sentence
+        if wordCount == 0:
+            continue
+        for word, TFIDFValue in TFIDFTable.items():
+            sentenceScoreSum += TFIDFValue
+        
+        sentenceScore[sentence] = sentenceScoreSum/wordCount
+    
+    return sentenceScore
+
+#Calculate the threshold by taking average of sentence score
+def avgSentenceScore(sentenceValues) -> float:
+    sumValues = 0
+
+    for sentence in sentenceValues:
+        sumValues += sentenceValues[sentence]
+    
+    return (sumValues/len(sentenceValues))
+
+#Select the sentences whose score is more than the average.
+def generateSummary(sentences, sentenceScores, supportThreshold):
+    summary = ''
+
+    for sentence in sentences:
+        if sentence[:15] in sentenceScores and sentenceScores[sentence[:15]] >= supportThreshold:
+            summary += " " + sentence
+    
+    return summary
+
 
 
 if __name__ == "__main__":
-    text = "When I do count the clock that tells the time. And see the brave day sunk in hideous night, When I behold the violet past prime,"
-    sentences = sent_tokenize(text) #All the sentences segregated based on full stop.
-    FrequnceyMatrix = createFrequencyMatrix(sentences=sentences)
+    spark = SparkSession.builder.appName("TextSummarization").getOrCreate()
+    path = os.getcwd()
+    df = spark.read.text(os.getcwd() + '/input.txt', lineSep=".")
+    cleanedSentences = df.withColumn("value", regexp_replace(col("value"), "[\n\r]", "" ))
+    Sentences = (cleanedSentences.rdd.flatMap(lambda x:x).collect())
+    FrequnceyMatrix = createFrequencyMatrix(sentences=Sentences)
     print("Frequency Matrix is: ", FrequnceyMatrix, '\n')
     TFMatrix = (createTFMatrix(FrequnceyMatrix))
     print("Term Frequency Matrix is: ",TFMatrix, '\n')
     countDocPerWords = (getSentencesPerWord(FrequnceyMatrix))
-    totalDocuments = len(sentences) #Number of sentences in the document.
-    print(createIDFMatrix(FrequnceyMatrix, countDocPerWords=countDocPerWords, totalDocuments=totalDocuments))
+    totalDocuments = len(Sentences) #Number of sentences in the document.
+    IDFMatrix = createIDFMatrix(FrequnceyMatrix, countDocPerWords=countDocPerWords, totalDocuments=totalDocuments)
+    print("Inverse Document Frequencey is: ",IDFMatrix , '\n')
+    TF_IDF_Matrix = createTFIDFMatrix(TFMatrix, IDFMatrix)
+    print("TF-IDF Matrix is: ", TF_IDF_Matrix, '\n')
+    sentenceScores = (scoreSentences(TF_IDF_Matrix))
+    print("Sentence values are: ", sentenceScores, '\n')
+    supportThreshold = avgSentenceScore(sentenceScores)
+    print("The support threshold is: ", supportThreshold, '\n')
+    summary = (generateSummary(Sentences, sentenceScores, supportThreshold))
+    with open(path + "/output.txt", mode ='w') as file:
+        file.write(summary)
+    
+
+
+
